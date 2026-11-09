@@ -1,0 +1,122 @@
+
+name: Sync upstream uBlock
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Check and sync upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Получаем исходники нашего форка
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: master
+          fetch-depth: 0
+
+      # 2. Получаем изменения оригинального uBlock
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream \
+            https://github.com/gorhill/uBlock.git
+
+          git fetch --no-tags upstream \
+            +refs/heads/master:refs/remotes/upstream/master
+
+      # 3. Готовим отдельную ветку для обновления
+      - name: Prepare synchronization branch
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="$(git rev-parse HEAD)"
+          UPSTREAM_SHA="$(git rev-parse refs/remotes/upstream/master)"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$BASE_SHA"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork is already up to date."
+            exit 0
+          fi
+
+          BRANCH="automation/sync-upstream"
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin \
+            "refs/heads/$BRANCH" >/dev/null 2>&1; then
+
+            git fetch origin \
+              "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+
+            git switch --create "$BRANCH" \
+              --track "origin/$BRANCH"
+
+            git merge --no-edit "$BASE_SHA"
+
+          else
+
+            git switch --create "$BRANCH" "$BASE_SHA"
+
+          fi
+
+          git merge --no-edit --no-ff "$UPSTREAM_SHA"
+
+          git push origin "$BRANCH"
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # 4. Создаём Pull Request
+      - name: Create or update Pull Request
+        if: steps.sync.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_BRANCH: ${{ steps.sync.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          EXISTING_PR="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --head "$SYNC_BRANCH" \
+            --json url \
+            --jq '.[0].url // empty')"
+
+          if [[ -z "$EXISTING_PR" ]]; then
+
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base master \
+              --head "$SYNC_BRANCH" \
+              --title "Sync upstream uBlock" \
+              --body "Automatic synchronization with the official gorhill/uBlock master branch.
+
+          Please review all changes before merging.
+          This workflow does not merge changes automatically."
+
+          else
+
+            echo "Existing Pull Request updated: $EXISTING_PR"
+
+          fi
