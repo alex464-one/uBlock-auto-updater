@@ -1,0 +1,265 @@
+
+name: Publish stable Chromium CRX
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 8 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-stable-crx
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/master'
+    name: Build and publish stable uBlock
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get latest stable upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          JSON="$(gh api repos/gorhill/uBlock/releases/latest)"
+
+          TAG="$(jq -r '.tag_name // empty' <<< "$JSON")"
+          PRERELEASE="$(jq -r '.prerelease' <<< "$JSON")"
+          DRAFT="$(jq -r '.draft' <<< "$JSON")"
+
+          if [[ -z "$TAG" || "$PRERELEASE" != "false" || "$DRAFT" != "false" ]]; then
+            echo "::error::No valid stable release found."
+            exit 1
+          fi
+
+          if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected release tag: $TAG"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          jq -r '.body // ""' <<< "$JSON" \
+            > "$RUNNER_TEMP/upstream-release-notes.md"
+
+          echo "Latest stable release: $TAG"
+
+      - name: Check existing release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$UPSTREAM_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release already exists."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "New release required."
+          fi
+
+      - name: Download exact upstream release source
+        if: steps.existing.outputs.exists == 'false'
+        id: source
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --branch "$UPSTREAM_TAG" \
+            https://github.com/gorhill/uBlock.git upstream
+
+          SOURCE_SHA="$(git -C upstream rev-parse HEAD)"
+          VERSION="$(tr -d '\r\n' < upstream/dist/version)"
+          EXPECTED_VERSION="${UPSTREAM_TAG#v}"
+
+          if [[ "$VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "::error::Version mismatch: $VERSION != $EXPECTED_VERSION"
+            exit 1
+          fi
+
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js 22
+        if: steps.existing.outputs.exists == 'false'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22.x'
+          package-manager-cache: false
+
+      - name: Download uAssets
+        if: steps.existing.outputs.exists == 'false'
+        working-directory: upstream
+        run: bash tools/pull-assets.sh
+
+      - name: Build Chromium
+        if: steps.existing.outputs.exists == 'false'
+        working-directory: upstream
+        run: bash tools/make-chromium.sh all
+
+      - name: Verify Chromium build
+        if: steps.existing.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s upstream/dist/build/uBlock0.chromium/manifest.json
+          test -s upstream/dist/build/uBlock0.chromium.zip
+
+      - name: Install CRX3 packager
+        if: steps.existing.outputs.exists == 'false'
+        run: npm install --global crx3@2.0.0
+
+      - name: Decode signing key
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          UBLOCK_SIGNING_KEY_B64: ${{ secrets.UBLOCK_SIGNING_KEY_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${UBLOCK_SIGNING_KEY_B64:-}" ]]; then
+            echo "::error::Signing key secret is missing."
+            exit 1
+          fi
+
+          KEY_FILE="${RUNNER_TEMP}/ublock-signing.pem"
+
+          printf '%s' "$UBLOCK_SIGNING_KEY_B64" \
+            | base64 --decode > "$KEY_FILE"
+
+          chmod 600 "$KEY_FILE"
+
+          openssl pkey -in "$KEY_FILE" -noout
+
+          echo "UBLOCK_KEY_FILE=$KEY_FILE" >> "$GITHUB_ENV"
+
+      - name: Create signed CRX3
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          UPSTREAM_VERSION: ${{ steps.source.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          crx3 \
+            --key "$UBLOCK_KEY_FILE" \
+            --crx "upstream/dist/build/uBlock0_${UPSTREAM_VERSION}.chromium.crx" \
+            "upstream/dist/build/uBlock0.chromium"
+
+      - name: Verify CRX3 and extension ID
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          EXPECTED_EXTENSION_ID: ioadkgmoekakepbdfldgeckpiplpgkmj
+          UPSTREAM_VERSION: ${{ steps.source.outputs.version }}
+        shell: bash
+        run: |
+          python3 - "$UBLOCK_KEY_FILE" \
+            "upstream/dist/build/uBlock0_${UPSTREAM_VERSION}.chromium.crx" \
+            "$EXPECTED_EXTENSION_ID" <<'PY'
+          import hashlib
+          import pathlib
+          import subprocess
+          import sys
+
+          key_path, crx_path, expected_id = sys.argv[1:]
+          data = pathlib.Path(crx_path).read_bytes()
+
+          if len(data) < 12 or data[:4] != b"Cr24":
+              raise SystemExit("Invalid CRX header")
+
+          version = int.from_bytes(data[4:8], "little")
+          header_size = int.from_bytes(data[8:12], "little")
+          zip_offset = 12 + header_size
+
+          if version != 3:
+              raise SystemExit("Expected CRX3")
+
+          if data[zip_offset:zip_offset + 4] != b"PK\x03\x04":
+              raise SystemExit("ZIP payload missing")
+
+          public_der = subprocess.check_output([
+              "openssl", "pkey", "-in", key_path,
+              "-pubout", "-outform", "DER"
+          ])
+
+          digest = hashlib.sha256(public_der).digest()[:16]
+
+          actual_id = "".join(
+              chr(ord("a") + nibble)
+              for byte in digest
+              for nibble in (byte >> 4, byte & 15)
+          )
+
+          print(f"Extension ID: {actual_id}")
+
+          if actual_id != expected_id:
+              raise SystemExit(
+                  f"ID mismatch: expected {expected_id}"
+              )
+
+          print("Extension ID verified.")
+          PY
+
+      - name: Prepare release notes
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          UPSTREAM_VERSION: ${{ steps.source.outputs.version }}
+        shell: bash
+        run: |
+          {
+            echo "Personal signed Chromium build."
+            echo
+            echo "Source: gorhill/uBlock"
+            echo "Upstream release: $UPSTREAM_TAG"
+            echo "Source commit: $SOURCE_SHA"
+            echo "Version: $UPSTREAM_VERSION"
+            echo "Extension ID: ioadkgmoekakepbdfldgeckpiplpgkmj"
+            echo
+            echo "This is an independently signed build, not an official upstream binary."
+            echo
+            echo "## Upstream release notes"
+            echo
+            cat "$RUNNER_TEMP/upstream-release-notes.md"
+          } > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Remove temporary signing key
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${UBLOCK_KEY_FILE:-}" ]]; then
+            rm -f "$UBLOCK_KEY_FILE"
+          fi
+
+      - name: Publish GitHub release
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_VERSION: ${{ steps.source.outputs.version }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "$UPSTREAM_TAG" \
+            "upstream/dist/build/uBlock0_${UPSTREAM_VERSION}.chromium.crx" \
+            "upstream/dist/build/uBlock0.chromium.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "uBlock Origin ${UPSTREAM_VERSION} — signed build" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --latest
