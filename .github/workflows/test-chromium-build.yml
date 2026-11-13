@@ -1,5 +1,5 @@
 
-name: Test Chromium build
+name: Build signed Chromium CRX
 
 on:
   workflow_dispatch:
@@ -9,7 +9,8 @@ permissions:
 
 jobs:
   build:
-    name: Build Chromium package
+    if: github.ref == 'refs/heads/master'
+    name: Build and sign Chromium package
     runs-on: ubuntu-latest
 
     steps:
@@ -18,19 +19,126 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22.x'
+          package-manager-cache: false
+
       - name: Download uAssets
         run: bash tools/pull-assets.sh
 
       - name: Build Chromium package
         run: bash tools/make-chromium.sh all
 
-      - name: Verify output
-        run: test -s dist/build/uBlock0.chromium.zip
+      - name: Verify build
+        run: |
+          set -euo pipefail
+          test -s dist/build/uBlock0.chromium/manifest.json
+          test -s dist/build/uBlock0.chromium.zip
+          echo "Source version:"
+          cat dist/version
 
-      - name: Upload build artifact
+      - name: Decode signing key
+        shell: bash
+        env:
+          UBLOCK_SIGNING_KEY_B64: ${{ secrets.UBLOCK_SIGNING_KEY_B64 }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${UBLOCK_SIGNING_KEY_B64:-}" ]]; then
+            echo "::error::Secret UBLOCK_SIGNING_KEY_B64 is missing."
+            exit 1
+          fi
+
+          KEY_FILE="${RUNNER_TEMP}/ublock-signing.pem"
+
+          printf '%s' "$UBLOCK_SIGNING_KEY_B64" \
+            | base64 --decode > "$KEY_FILE"
+
+          chmod 600 "$KEY_FILE"
+
+          openssl pkey -in "$KEY_FILE" -noout
+
+          echo "UBLOCK_KEY_FILE=$KEY_FILE" >> "$GITHUB_ENV"
+
+      - name: Create signed CRX3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTENSION_DIR="dist/build/uBlock0.chromium"
+          CRX_FILE="dist/build/uBlock0.chromium.crx"
+
+          npx --yes crx3@2.0.0 \
+            --key "$UBLOCK_KEY_FILE" \
+            --crx "$CRX_FILE" \
+            "$EXTENSION_DIR"
+
+          test -s "$CRX_FILE"
+
+      - name: Verify CRX3 and calculate extension ID
+        shell: bash
+        run: |
+          python3 - "$UBLOCK_KEY_FILE" \
+            "dist/build/uBlock0.chromium.crx" <<'PY'
+          import hashlib
+          import pathlib
+          import subprocess
+          import sys
+
+          key_path = sys.argv[1]
+          crx_path = pathlib.Path(sys.argv[2])
+          data = crx_path.read_bytes()
+
+          if len(data) < 12 or data[:4] != b"Cr24":
+              raise SystemExit("Invalid CRX header")
+
+          version = int.from_bytes(data[4:8], "little")
+          header_size = int.from_bytes(data[8:12], "little")
+          zip_offset = 12 + header_size
+
+          if version != 3:
+              raise SystemExit(f"Expected CRX3, got CRX{version}")
+
+          if data[zip_offset:zip_offset + 4] != b"PK\x03\x04":
+              raise SystemExit("ZIP payload is missing")
+
+          public_der = subprocess.check_output([
+              "openssl", "pkey",
+              "-in", key_path,
+              "-pubout", "-outform", "DER"
+          ])
+
+          digest = hashlib.sha256(public_der).digest()[:16]
+
+          extension_id = "".join(
+              chr(ord("a") + nibble)
+              for byte in digest
+              for nibble in (byte >> 4, byte & 15)
+          )
+
+          print(f"CRX3 valid: {crx_path.stat().st_size} bytes")
+          print(f"Extension ID: {extension_id}")
+          PY
+
+      - name: Remove temporary signing key
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/ublock-signing.pem"
+
+      - name: Upload ZIP artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: ublock-chromium-test
+          name: ublock-chromium-zip-test
           path: dist/build/uBlock0.chromium.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload signed CRX artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ublock-chromium-signed-test
+          path: dist/build/uBlock0.chromium.crx
           if-no-files-found: error
           retention-days: 7
