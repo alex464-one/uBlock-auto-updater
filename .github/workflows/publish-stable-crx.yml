@@ -278,12 +278,16 @@ jobs:
       - name: Prepare release notes
         shell: bash
         run: |
+          set -euo pipefail
+
+          SOURCE_SHA="$(cat package/source-sha.txt)"
+
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
           Personal signed Chromium build of uBlock Origin.
 
           Upstream: https://github.com/gorhill/uBlock
           Upstream version: ${{ needs.prepare.outputs.version }}
-          Source commit: ${{ env.UPSTREAM_SHA }}
+          Source commit: ${SOURCE_SHA}
 
           Extension ID: ioadkgmoekakepbdfldgeckpiplpgkmj
 
