@@ -1,0 +1,232 @@
+name: Publish updater assets
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - Publish stable Chromium CRX
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-updater-assets
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Attach updater files to latest uBlock release
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'master' &&
+       github.event.workflow_run.event != 'pull_request')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Generate manifest and upload updater assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TRIGGER_EVENT: ${{ github.event_name }}
+          UPSTREAM_RUN_STARTED_AT: ${{ github.event.workflow_run.run_started_at || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Reading the latest published uBlock release..."
+          RELEASE_JSON="$(gh api "repos/${REPOSITORY}/releases/latest")"
+          TAG="$(jq -r '.tag_name // empty' <<< "$RELEASE_JSON")"
+          BODY="$(jq -r '.body // ""' <<< "$RELEASE_JSON")"
+          RELEASE_CREATED_AT="$(jq -r '.created_at // empty' <<< "$RELEASE_JSON")"
+
+          if [[ "$TRIGGER_EVENT" == "workflow_run" ]]; then
+            if [[ -z "$UPSTREAM_RUN_STARTED_AT" || -z "$RELEASE_CREATED_AT" ]]; then
+              echo "::error::Could not compare workflow and release timestamps."
+              exit 1
+            fi
+
+            RUN_STARTED_EPOCH="$(date -u -d "$UPSTREAM_RUN_STARTED_AT" +%s)"
+            RELEASE_CREATED_EPOCH="$(date -u -d "$RELEASE_CREATED_AT" +%s)"
+
+            if (( RELEASE_CREATED_EPOCH < RUN_STARTED_EPOCH )); then
+              echo "No new release was created by the completed CRX workflow; nothing to attach."
+              exit 0
+            fi
+          fi
+
+          if [[ ! "$TAG" =~ ^uBlock-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected release tag: ${TAG:-<empty>}"
+            exit 1
+          fi
+
+          VERSION="${TAG#uBlock-}"
+          SOURCE_SHA="$(sed -nE 's/^Source commit: ([[:xdigit:]]{7,40})[[:space:]]*$/\1/p' <<< "$BODY" | head -n 1)"
+
+          if [[ -z "$SOURCE_SHA" ]]; then
+            echo "::error::Could not read Source commit from release notes."
+            exit 1
+          fi
+
+          CRX_NAME="uBlock0_${VERSION}.chromium.crx"
+          EXPECTED_EXTENSION_ID="ioadkgmoekakepbdfldgeckpiplpgkmj"
+          SCRIPT_NAME="ublock-auto-updater.user.js"
+          MANIFEST_NAME="ublock-update.json"
+          WORK_DIR="$RUNNER_TEMP/updater-release-assets"
+          mkdir -p "$WORK_DIR"
+
+          CRX_COUNT="$(jq --arg name "$CRX_NAME" '[.assets[] | select(.name == $name)] | length' <<< "$RELEASE_JSON")"
+          if [[ "$CRX_COUNT" != "1" ]]; then
+            echo "::error::Expected exactly one ${CRX_NAME} asset in release ${TAG}."
+            exit 1
+          fi
+
+          echo "Downloading ${CRX_NAME}..."
+          gh release download "$TAG" \
+            --repo "$REPOSITORY" \
+            --pattern "$CRX_NAME" \
+            --dir "$WORK_DIR"
+
+          CRX_PATH="$WORK_DIR/$CRX_NAME"
+          test -s "$CRX_PATH"
+
+          echo "Verifying CRX3 header and Extension ID..."
+          python3 - "$CRX_PATH" "$EXPECTED_EXTENSION_ID" <<'PY'
+          import pathlib
+          import sys
+
+          crx_path, expected_id = sys.argv[1:]
+          data = pathlib.Path(crx_path).read_bytes()
+
+          if len(data) < 16 or data[:4] != b"Cr24":
+              raise SystemExit("Invalid CRX magic/header")
+
+          version = int.from_bytes(data[4:8], "little")
+          header_size = int.from_bytes(data[8:12], "little")
+          header_end = 12 + header_size
+
+          if version != 3 or header_size <= 0 or header_end + 4 > len(data):
+              raise SystemExit("Expected a valid CRX3 header")
+
+          if data[header_end:header_end + 4] != b"PK\x03\x04":
+              raise SystemExit("CRX ZIP payload is missing")
+
+          def read_varint(buf, pos):
+              value = 0
+              shift = 0
+              while pos < len(buf) and shift < 35:
+                  byte = buf[pos]
+                  pos += 1
+                  value |= (byte & 0x7f) << shift
+                  if not byte & 0x80:
+                      return value, pos
+                  shift += 7
+              raise ValueError("Invalid protobuf varint")
+
+          def find_bytes(buf, wanted_field):
+              pos = 0
+              while pos < len(buf):
+                  key, pos = read_varint(buf, pos)
+                  field_number, wire_type = key >> 3, key & 7
+                  if wire_type == 0:
+                      _, pos = read_varint(buf, pos)
+                  elif wire_type == 1:
+                      pos += 8
+                  elif wire_type == 2:
+                      length, pos = read_varint(buf, pos)
+                      end = pos + length
+                      if end > len(buf):
+                          raise ValueError("Truncated protobuf field")
+                      if field_number == wanted_field:
+                          return buf[pos:end]
+                      pos = end
+                  elif wire_type == 5:
+                      pos += 4
+                  else:
+                      raise ValueError("Unsupported protobuf wire type")
+                  if pos > len(buf):
+                      raise ValueError("Truncated protobuf data")
+              return None
+
+          header = data[12:header_end]
+          signed_header = find_bytes(header, 10000)
+          if signed_header is None:
+              raise SystemExit("CRX3 signed_header_data is missing")
+
+          crx_id_bytes = find_bytes(signed_header, 1)
+          if crx_id_bytes is None or len(crx_id_bytes) != 16:
+              raise SystemExit("CRX3 Extension ID field is invalid")
+
+          actual_id = "".join(
+              chr(ord("a") + nibble)
+              for byte in crx_id_bytes
+              for nibble in (byte >> 4, byte & 0x0f)
+          )
+
+          print(f"CRX Extension ID: {actual_id}")
+          if actual_id != expected_id:
+              raise SystemExit("CRX Extension ID does not match expected ID")
+
+          print("CRX3 header and Extension ID verified.")
+          PY
+
+          CRX_SHA256="$(sha256sum "$CRX_PATH" | awk '{print $1}')"
+          echo "CRX SHA-256: ${CRX_SHA256}"
+
+          echo "Retrieving the canonical Tampermonkey userscript from master..."
+          gh api \
+            "repos/${REPOSITORY}/contents/userscript/${SCRIPT_NAME}?ref=master" \
+            --jq '.content' \
+            | tr -d '\n' \
+            | base64 --decode > "$WORK_DIR/$SCRIPT_NAME"
+
+          test -s "$WORK_DIR/$SCRIPT_NAME"
+          grep -Eq '^// @version[[:space:]]+1\.1\.0[[:space:]]*$' "$WORK_DIR/$SCRIPT_NAME"
+          grep -Fq 'https://github.com/alex464-one/uBlock-auto-updater/releases/latest/download/ublock-auto-updater.user.js' "$WORK_DIR/$SCRIPT_NAME"
+
+          echo "Generating ${MANIFEST_NAME}..."
+          jq -n \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --arg extension_id "$EXPECTED_EXTENSION_ID" \
+            --arg crx "$CRX_NAME" \
+            --arg sha256 "$CRX_SHA256" \
+            --arg source_commit "$SOURCE_SHA" \
+            --arg source_repository "gorhill/uBlock" \
+            '{
+              schema_version: 1,
+              version: $version,
+              tag: $tag,
+              extension_id: $extension_id,
+              crx: $crx,
+              sha256: $sha256,
+              source_commit: $source_commit,
+              source_repository: $source_repository
+            }' > "$WORK_DIR/$MANIFEST_NAME"
+
+          jq -e . "$WORK_DIR/$MANIFEST_NAME" >/dev/null
+
+          echo "Uploading ${SCRIPT_NAME} and ${MANIFEST_NAME} to ${TAG}..."
+          gh release upload "$TAG" \
+            "$WORK_DIR/$SCRIPT_NAME" \
+            "$WORK_DIR/$MANIFEST_NAME" \
+            --repo "$REPOSITORY" \
+            --clobber
+
+          UPDATED_RELEASE="$(gh api "repos/${REPOSITORY}/releases/tags/${TAG}")"
+          for asset in "$CRX_NAME" "$SCRIPT_NAME" "$MANIFEST_NAME"; do
+            if ! jq -e --arg name "$asset" '.assets[] | select(.name == $name)' \
+              <<< "$UPDATED_RELEASE" >/dev/null; then
+              echo "::error::Release asset verification failed: ${asset}"
+              exit 1
+            fi
+          done
+
+          echo "Updater assets successfully published to ${TAG}."
+          echo "Version: ${VERSION}"
+          echo "CRX SHA-256: ${CRX_SHA256}"
